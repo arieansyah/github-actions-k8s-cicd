@@ -1,0 +1,210 @@
+name: Production Workflow - Build and Push to Registry
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["main"]
+
+env:
+  REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  NAMESPACE: ${{ vars.NAMESPACE }}
+  CHART_PATH: ./helm/production.yaml
+  KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+  DNS_NAME: ${{ vars.DNS_NAME }}
+  VAULT_PATH: ${{ vars.VAULT_PATH }}
+  VAULT_ROLE: ${{ vars.VAULT_ROLE }}
+  VAULT_AUTH_PATH: ${{ vars.VAULT_AUTH_PATH }}
+  CPU_LIMIT: ${{ vars.CPU_LIMIT }}
+  MEMORY_LIMIT: ${{ vars.MEMORY_LIMIT }}
+  CPU_REQUEST: ${{ vars.CPU_REQUEST }}
+  MEMORY_REQUEST: ${{ vars.MEMORY_REQUEST }}
+
+jobs:
+  extract-and-calc-version:
+    name: Extract and Calculate SemVer
+    if: github.event.pull_request.merged == true
+    runs-on:
+      group: Production
+      labels: [self-hosted, Linux, Production, X64]
+    environment: production
+    outputs:
+      new_version: ${{ steps.calculate_semver.outputs.new_version }}
+      new_version_without_v: ${{ steps.calculate_semver.outputs.new_version_without_v }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: tiacsys/clean-after-action@v3
+
+      - name: Extract Version from PR Title
+        id: extract_version
+        run: |
+          pr_title="${{ github.event.pull_request.title }}"
+          version_type=$(echo "$pr_title" | grep -E -o '\[(major|minor|patch)\]' | tr -d '[]' || echo "patch")
+          echo "version_type=$version_type" >> $GITHUB_OUTPUT
+
+      - name: Calculate New SemVer
+        id: calculate_semver
+        run: |
+          current_version=$(git tag --list | grep -v '\-alpha' | grep -v '\-beta' | sort -V -r | head -n 1)
+          current_version=${current_version:-"v0.0.0"}
+
+          base_version=${current_version}
+          IFS='.' read -r major minor patch <<< "${base_version#v}"
+          major=${major:-0}
+          minor=${minor:-0}
+          patch=${patch:-0}
+
+          case "${{ steps.extract_version.outputs.version_type }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch|*) patch=$((patch + 1)) ;;
+          esac
+
+          new_version="v$major.$minor.$patch"
+          new_version_without_v="$major.$minor.$patch"
+
+          echo "new_version=$new_version" >> $GITHUB_OUTPUT
+          echo "new_version_without_v=$new_version_without_v" >> $GITHUB_OUTPUT
+
+  build-and-push-docker:
+    name: Build and Push Docker Image
+    runs-on:
+      group: Production
+      labels: [self-hosted, Linux, Production, X64]
+    environment: production
+    needs: extract-and-calc-version
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Authenticate to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ${{ env.REGISTRY_URL }}
+
+      - name: Build and Push Docker Container
+        run: |
+          DOCKER_TAG="${{ env.IMAGE_NAME }}:${{ needs.extract-and-calc-version.outputs.new_version }}"
+          docker build \
+            --tag "${DOCKER_TAG}" \
+            --build-arg GITHUB_SHA="${GITHUB_SHA}" \
+            --build-arg GITHUB_REF="${GITHUB_REF}" \
+            .
+          docker push "${DOCKER_TAG}"
+
+  package-and-push-helm:
+    name: Package and Push Helm Chart
+    runs-on:
+      group: Production
+      labels: [self-hosted, Linux, Production, X64]
+    environment: production
+    needs: [extract-and-calc-version, build-and-push-docker]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Update Helm Chart Version
+        run: |
+          sed -i "s/^version:.*/version: \"${{ needs.extract-and-calc-version.outputs.new_version_without_v }}\"/" helm/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ needs.extract-and-calc-version.outputs.new_version }}\"/" helm/Chart.yaml
+          sed -i "s/^  tag:.*/  tag: \"${{ needs.extract-and-calc-version.outputs.new_version }}\"/" ${{ env.CHART_PATH }}
+
+      - name: Package and Push Helm Chart
+        env:
+          HELM_EXPERIMENTAL_OCI: 1
+        run: |
+          helm registry login ${{ env.REGISTRY_URL }} \
+            -u ${{ secrets.REGISTRY_USERNAME }} \
+            -p ${{ secrets.REGISTRY_PASSWORD }}
+          mkdir -p packaged
+          helm package ./helm --destination packaged
+          helm push packaged/*.tgz oci://${{ env.REGISTRY_URL }}/charts
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on:
+      group: Production
+      labels: [self-hosted, Linux, Production, X64]
+    environment: production
+    needs: [extract-and-calc-version, package-and-push-helm]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Setup Kubernetes Authentication
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ env.KUBE_CONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy with Helm
+        env:
+          HELM_EXPERIMENTAL_OCI: 1
+        run: |
+          helm registry login ${{ env.REGISTRY_URL }} \
+            -u ${{ secrets.REGISTRY_USERNAME }} \
+            -p ${{ secrets.REGISTRY_PASSWORD }}
+
+          CHART_VERSION="${{ needs.extract-and-calc-version.outputs.new_version_without_v }}"
+          helm upgrade --install my-app \
+            oci://${{ env.REGISTRY_URL }}/charts/my-app --version ${CHART_VERSION} \
+            --namespace ${{ env.NAMESPACE }} \
+            -f ${{ env.CHART_PATH }} \
+            --set image.tag="${{ needs.extract-and-calc-version.outputs.new_version }}" \
+            --set version="${{ needs.extract-and-calc-version.outputs.new_version_without_v }}" \
+            --set appVersion="${{ needs.extract-and-calc-version.outputs.new_version }}" \
+            --set "podAnnotations.vault\.hashicorp\.com/auth-path=${{ env.VAULT_AUTH_PATH }}" \
+            --set "podAnnotations.vault\.hashicorp\.com/role=${{ env.VAULT_ROLE }}" \
+            --set "podAnnotations.vault\.hashicorp\.com/agent-inject-secret-env=${{ env.VAULT_PATH }}" \
+            --set ingress.hosts[0].host="${{ env.DNS_NAME }}" \
+            --set ingress.tls[0].hosts[0]="${{ env.DNS_NAME }}" \
+            --set resources.requests.cpu="${{ env.CPU_REQUEST }}" \
+            --set resources.requests.memory="${{ env.MEMORY_REQUEST }}" \
+            --set resources.limits.cpu="${{ env.CPU_LIMIT }}" \
+            --set resources.limits.memory="${{ env.MEMORY_LIMIT }}" \
+            --atomic \
+            --timeout 5m
+
+  create-and-push-git-tag:
+    name: Create and Push Git Tag
+    runs-on:
+      group: Production
+      labels: [self-hosted, Linux, Production, X64]
+    environment: production
+    needs: [extract-and-calc-version, build-and-push-docker, deploy]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Create and Push Git Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "devops@example.com"
+          git config --local user.name "devops-team"
+          git tag -a "${{ needs.extract-and-calc-version.outputs.new_version }}" -m "Release ${{ needs.extract-and-calc-version.outputs.new_version }}"
+          git push origin "${{ needs.extract-and-calc-version.outputs.new_version }}"
